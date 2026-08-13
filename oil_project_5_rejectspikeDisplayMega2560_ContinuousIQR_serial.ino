@@ -25,7 +25,7 @@ unsigned long lastContinuousUpdate = 0;
 unsigned long lastRawSerialOutput = 0;
 
 // Adjustable interval for the always-on VPHS/VMAG Serial stream.
-const unsigned long SERIAL_OUTPUT_INTERVAL_MS = 50UL;
+const unsigned long SERIAL_OUTPUT_INTERVAL_MS = 1000UL;
 const unsigned long SAMPLE_INTERVAL_MS = 1000UL;
 const unsigned long K1_LONG_PRESS_MS = 3000UL;
 

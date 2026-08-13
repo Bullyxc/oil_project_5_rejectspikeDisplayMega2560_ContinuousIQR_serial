@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 
 BAUD_RATE = 9600
+PLOT_REFRESH_INTERVAL_SECONDS = 0.10
+LIVE_WINDOW_SECONDS = 30.0 * 60.0
+SERIAL_READ_TIMEOUT_SECONDS = 0.05
 STANDARD_RECORD_TYPES = {"DATA", "K3_PRESS", "K3_CAL"}
 SAMPLE_RECORD_TYPES = {"K3_SAMPLE"}
 
@@ -35,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--simulate", action="store_true")
     parser.add_argument("--simulation-interval", type=float, default=0.03)
+    parser.add_argument(
+        "--live-window",
+        type=float,
+        default=LIVE_WINDOW_SECONDS,
+        help="Seconds shown in the live window; use 0 to show all data",
+    )
     return parser.parse_args()
 
 
@@ -87,7 +97,7 @@ def choose_serial_port(requested_port: str | None) -> str:
 
 
 class RealtimePlot:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, live_window_seconds: float) -> None:
         try:
             import matplotlib.pyplot as plt
             from matplotlib.widgets import Button, TextBox
@@ -96,7 +106,12 @@ class RealtimePlot:
 
         self.plt = plt
         self.output_dir = output_dir
+        self.live_window_seconds = max(0.0, live_window_seconds)
         self.stop_requested = False
+        self.dirty = True
+        self.legend_dirty = False
+        self.last_refresh_at = 0.0
+        self.latest_elapsed = 0.0
         self.graph_title = "VPHS / VMAG Measurement"
         self.first_device_ms: int | None = None
         self.times: list[float] = []
@@ -114,9 +129,6 @@ class RealtimePlot:
 
         self.vphs_line = self.axes[0].plot([], [], color="#2563EB", linewidth=1.5)[0]
         self.vmag_line = self.axes[1].plot([], [], color="#DC2626", linewidth=1.5)[0]
-        self.press_artists = []
-        self.cal_artists = []
-        self.sample_artists = []
 
         self.axes[0].set_title("VPHS - Time Domain")
         self.axes[0].set_ylabel("VPHS (V)")
@@ -168,120 +180,146 @@ class RealtimePlot:
 
     def add_record(self, record: SerialRecord) -> None:
         elapsed = self._elapsed_seconds(record.device_ms)
+        self.latest_elapsed = max(self.latest_elapsed, elapsed)
         if record.record_type == "DATA":
             self.times.append(elapsed)
             self.vphs_values.append(record.vphs)
             self.vmag_values.append(record.vmag)
         elif record.record_type == "K3_PRESS":
             self.press_stamps.append((elapsed, record.vphs, record.vmag))
+            self._add_k3_press_artists(elapsed, record.vphs, record.vmag)
             print(
                 f"K3 pressed at {elapsed:.1f}s: "
                 f"VPHS={record.vphs:.3f}, VMAG={record.vmag:.3f}"
             )
         elif record.record_type == "K3_CAL":
             self.cal_stamps.append((elapsed, record.vphs, record.vmag))
+            self._add_k3_cal_artists(elapsed, record.vphs, record.vmag)
             print(
                 f"K3 calibration result at {elapsed:.1f}s: "
                 f"VPHS={record.vphs:.3f}, VMAG={record.vmag:.3f}"
             )
         elif record.record_type in SAMPLE_RECORD_TYPES and record.sample_index is not None:
             self.cal_samples.append((elapsed, record.sample_index, record.vphs, record.vmag))
+            self._add_cal_sample_artists(
+                elapsed, record.sample_index, record.vphs, record.vmag
+            )
             print(
                 f"CAL {record.sample_index} at {elapsed:.1f}s: "
                 f"VPHS={record.vphs:.3f}, VMAG={record.vmag:.3f}"
             )
-        self._refresh()
+        self.dirty = True
 
-    def _refresh(self) -> None:
-        self.vphs_line.set_data(self.times, self.vphs_values)
-        self.vmag_line.set_data(self.times, self.vmag_values)
-
-        for artist in self.press_artists + self.cal_artists + self.sample_artists:
-            artist.remove()
-        self.press_artists = []
-        self.cal_artists = []
-        self.sample_artists = []
-
-        for index, (elapsed, vphs, vmag) in enumerate(self.press_stamps):
-            label = "K3 pressed" if index == 0 else None
-            self.press_artists.extend(
-                [
-                    self.axes[0].scatter(
-                        elapsed, vphs, s=70, color="#FACC15", edgecolor="#854D0E",
-                        zorder=5, label=label,
-                    ),
-                    self.axes[1].scatter(
-                        elapsed, vmag, s=70, color="#FACC15", edgecolor="#854D0E",
-                        zorder=5, label=label,
-                    ),
-                ]
+    def _add_k3_press_artists(self, elapsed: float, vphs: float, vmag: float) -> None:
+        label = "K3 pressed" if len(self.press_stamps) == 1 else None
+        for axis, value in zip(self.axes, (vphs, vmag)):
+            axis.scatter(
+                elapsed, value, s=70, color="#FACC15", edgecolor="#854D0E",
+                zorder=5, label=label,
             )
+        if label:
+            self.legend_dirty = True
 
-        for index, (elapsed, vphs, vmag) in enumerate(self.cal_stamps):
-            label = "K3 calculated" if index == 0 else None
-            self.cal_artists.extend(
-                [
-                    self.axes[0].scatter(
-                        elapsed, vphs, s=110, marker="*", color="#FACC15",
-                        edgecolor="#713F12", zorder=6, label=label,
-                    ),
-                    self.axes[1].scatter(
-                        elapsed, vmag, s=110, marker="*", color="#FACC15",
-                        edgecolor="#713F12", zorder=6, label=label,
-                    ),
-                ]
+    def _add_k3_cal_artists(self, elapsed: float, vphs: float, vmag: float) -> None:
+        label = "K3 calculated" if len(self.cal_stamps) == 1 else None
+        for axis, value in zip(self.axes, (vphs, vmag)):
+            axis.scatter(
+                elapsed, value, s=110, marker="*", color="#FACC15",
+                edgecolor="#713F12", zorder=6, label=label,
             )
+        if label:
+            self.legend_dirty = True
 
-        self._draw_collected_samples(
-            self.cal_samples, "CAL", "#0891B2", "o", "Calibration samples"
-        )
+    def _add_cal_sample_artists(
+        self, elapsed: float, sample_index: int, vphs: float, vmag: float
+    ) -> None:
+        label = "Calibration samples" if len(self.cal_samples) == 1 else None
+        point_name = f"CAL {sample_index}"
+        for axis, value in zip(self.axes, (vphs, vmag)):
+            axis.scatter(
+                elapsed, value, s=48, marker="o", color="#0891B2",
+                edgecolor="white", linewidth=0.6, zorder=7, label=label,
+            )
+            axis.annotate(
+                point_name,
+                (elapsed, value),
+                xytext=(4, 7 if sample_index % 2 else -13),
+                textcoords="offset points",
+                fontsize=7,
+                color="#0891B2",
+                rotation=35,
+                zorder=8,
+            )
+        if label:
+            self.legend_dirty = True
 
-        for axis in self.axes:
-            axis.relim()
-            axis.autoscale_view()
-            handles, labels = axis.get_legend_handles_labels()
-            if labels:
-                axis.legend(loc="best")
+    def _refresh(self, *, force: bool = False, full_history: bool = False) -> None:
+        now = time.monotonic()
+        if not force:
+            if not self.dirty or now - self.last_refresh_at < PLOT_REFRESH_INTERVAL_SECONDS:
+                return
+
+        x_end = max(1.0, self.latest_elapsed)
+        if full_history or self.live_window_seconds <= 0.0:
+            x_start = 0.0
+        else:
+            x_start = max(0.0, x_end - self.live_window_seconds)
+
+        first_visible = bisect_left(self.times, x_start)
+        visible_times = self.times[first_visible:]
+        visible_vphs = self.vphs_values[first_visible:]
+        visible_vmag = self.vmag_values[first_visible:]
+        self.vphs_line.set_data(visible_times, visible_vphs)
+        self.vmag_line.set_data(visible_times, visible_vmag)
+
+        self.axes[0].set_xlim(x_start, x_end + max(1.0, (x_end - x_start) * 0.01))
+        self._set_y_limits(self.axes[0], visible_vphs, x_start, channel_index=1)
+        self._set_y_limits(self.axes[1], visible_vmag, x_start, channel_index=2)
+
+        if self.legend_dirty:
+            for axis in self.axes:
+                handles, labels = axis.get_legend_handles_labels()
+                if labels:
+                    axis.legend(loc="best")
+            self.legend_dirty = False
+
+        self.dirty = False
+        self.last_refresh_at = now
         self.figure.canvas.draw_idle()
 
-    def _draw_collected_samples(
-        self,
-        samples: list[tuple[float, int, float, float]],
-        name_prefix: str,
-        color: str,
-        marker: str,
-        legend_label: str,
+    def _set_y_limits(
+        self, axis, line_values: list[float], x_start: float, channel_index: int
     ) -> None:
-        for position, (elapsed, sample_index, vphs, vmag) in enumerate(samples):
-            point_name = f"{name_prefix} {sample_index}"
-            legend = legend_label if position == 0 else None
-            for axis, value in zip(self.axes, (vphs, vmag)):
-                point = axis.scatter(
-                    elapsed,
-                    value,
-                    s=48,
-                    marker=marker,
-                    color=color,
-                    edgecolor="white",
-                    linewidth=0.6,
-                    zorder=7,
-                    label=legend,
-                )
-                annotation = axis.annotate(
-                    point_name,
-                    (elapsed, value),
-                    xytext=(4, 7 if sample_index % 2 else -13),
-                    textcoords="offset points",
-                    fontsize=7,
-                    color=color,
-                    rotation=35,
-                    zorder=8,
-                )
-                self.sample_artists.extend([point, annotation])
+        values = list(line_values)
+        values.extend(
+            stamp[channel_index]
+            for stamp in self.press_stamps
+            if stamp[0] >= x_start
+        )
+        values.extend(
+            stamp[channel_index]
+            for stamp in self.cal_stamps
+            if stamp[0] >= x_start
+        )
+        sample_value_index = channel_index + 1
+        values.extend(
+            sample[sample_value_index]
+            for sample in self.cal_samples
+            if sample[0] >= x_start
+        )
+        if not values:
+            axis.set_ylim(0.0, 1.0)
+            return
+        minimum = min(values)
+        maximum = max(values)
+        span = maximum - minimum
+        padding = max(span * 0.08, abs((minimum + maximum) / 2.0) * 0.002, 0.0005)
+        axis.set_ylim(minimum - padding, maximum + padding)
 
     def process_events(self) -> None:
         if self.is_open():
-            self.plt.pause(0.01)
+            self._refresh()
+            self.plt.pause(0.001)
 
     def is_open(self) -> bool:
         return bool(self.plt.fignum_exists(self.figure.number))
@@ -299,6 +337,7 @@ class RealtimePlot:
         )
 
         self._set_title(self.title_box.text)
+        self._refresh(force=True, full_history=True)
         previous_bottom = self.figure.subplotpars.bottom
         self.title_box.ax.set_visible(False)
         self.save_button.ax.set_visible(False)
@@ -311,6 +350,7 @@ class RealtimePlot:
             self.title_box.ax.set_visible(True)
             self.save_button.ax.set_visible(True)
             self.help_text.set_visible(True)
+            self._refresh(force=True, full_history=False)
             self.figure.canvas.draw_idle()
         print(f"Graph saved: {output_path}")
         return output_path
@@ -355,7 +395,7 @@ def run_serial(args: argparse.Namespace, plot: RealtimePlot) -> int:
     print("Type or paste a graph title. Use Save JPG to capture; press Q to stop.")
     connection = None
     try:
-        connection = serial.Serial(port, args.baud, timeout=0.25)
+        connection = serial.Serial(port, args.baud, timeout=SERIAL_READ_TIMEOUT_SECONDS)
         time.sleep(2.0)
         connection.reset_input_buffer()
         while not plot.stop_requested and plot.is_open():
@@ -377,7 +417,7 @@ def run_serial(args: argparse.Namespace, plot: RealtimePlot) -> int:
 
 def main() -> int:
     args = parse_args()
-    plot = RealtimePlot(args.output_dir)
+    plot = RealtimePlot(args.output_dir, args.live_window)
     exit_code = 0
     try:
         exit_code = run_simulation(args, plot) if args.simulate else run_serial(args, plot)

@@ -109,16 +109,20 @@ Do not reintroduce `CONT`, `CAL`, `MEA`, per-minute logging, Excel logging, or t
 - Detects Serial ports and asks the user to choose when multiple ports exist; `--port COMx` can select one directly.
 - Accepts `DATA`, `K3_PRESS`, `K3_CAL`, and `K3_SAMPLE` records.
 - Uses Arduino `millis()` relative to the first accepted record for elapsed time in seconds.
+- Keeps all received DATA and marker values in memory, but the live lines show only the latest 30 minutes by default to keep rendering responsive. Use `--live-window 0` to show all history live or pass another duration in seconds.
+- Throttles screen redraws to at most 10 per second and uses a short Serial read timeout so the GUI remains responsive.
 - Shows two plots in one window:
   - VPHS versus elapsed time on top.
   - VMAG versus elapsed time on the bottom.
 - Marks `K3_PRESS` on both plots with yellow circles.
 - Marks successful `K3_CAL` values on both plots with yellow stars.
 - Marks every collected Calibration sample on both plots and annotates it `CAL 1`, `CAL 2`, and so on.
+- Creates K3 markers, CAL points, annotations, and legends only when each item first arrives; existing artists are not deleted and recreated on every DATA record.
 - K2 Measurement samples are not sent as special markers and are not annotated on the graph.
 - With the current `SAMPLE_COUNT = 10`, K3 contributes `CAL 1` through `CAL 10` on each plot.
 - Provides a TextBox for typing or pasting the graph title.
 - Provides a `Save JPG` button that captures the graph at that moment without stopping acquisition.
+- A saved JPG temporarily renders the complete stored history, then restores the live time window.
 - The save controls are temporarily hidden from the exported image and restored afterward.
 - Multiple saves are allowed. Files use capture timestamps including milliseconds and are not intentionally overwritten.
 - Default image directory: `realtime_graphs` beside the Python script.
