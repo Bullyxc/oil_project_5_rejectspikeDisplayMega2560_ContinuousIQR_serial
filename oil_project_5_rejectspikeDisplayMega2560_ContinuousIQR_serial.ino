@@ -25,7 +25,7 @@ unsigned long lastContinuousUpdate = 0;
 unsigned long lastRawSerialOutput = 0;
 
 // Adjustable interval for the always-on VPHS/VMAG Serial stream.
-const unsigned long SERIAL_OUTPUT_INTERVAL_MS = 1000UL;
+const unsigned long SERIAL_OUTPUT_INTERVAL_MS = 50UL;
 const unsigned long SAMPLE_INTERVAL_MS = 1000UL;
 const unsigned long K1_LONG_PRESS_MS = 3000UL;
 
@@ -437,6 +437,18 @@ void outputCalculatedCalibrationStamp() {
   Serial.println(ReferenceVMAG, 3);
 }
 
+void outputCollectedSample(const char* recordType, int sampleNumber, float vphs, float vmag) {
+  Serial.print(recordType);
+  Serial.print(',');
+  Serial.print(millis());
+  Serial.print(',');
+  Serial.print(sampleNumber);
+  Serial.print(',');
+  Serial.print(vphs, 3);
+  Serial.print(',');
+  Serial.println(vmag, 3);
+}
+
 void serviceRawSerialOutput() {
   if (millis() - lastRawSerialOutput >= SERIAL_OUTPUT_INTERVAL_MS) {
     outputRawSerialSample("DATA");
@@ -615,6 +627,7 @@ void calibrateReference() {
     float v1 = adc1*0.1875/1000;
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
+    outputCollectedSample("K3_SAMPLE", i + 1, v0, v1);
 
     updateSamplingProgress(i + 1);
   }

@@ -1,4 +1,4 @@
-"""Plot the Arduino VPHS/VMAG stream and K3 calibration stamps in real time."""
+"""Plot Arduino VPHS/VMAG data, K3 stamps, and collected samples in real time."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from pathlib import Path
 
 
 BAUD_RATE = 9600
-VALID_RECORD_TYPES = {"DATA", "K3_PRESS", "K3_CAL"}
+STANDARD_RECORD_TYPES = {"DATA", "K3_PRESS", "K3_CAL"}
+SAMPLE_RECORD_TYPES = {"K3_SAMPLE"}
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class SerialRecord:
     device_ms: int
     vphs: float
     vmag: float
+    sample_index: int | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,17 +40,22 @@ def parse_args() -> argparse.Namespace:
 
 def parse_serial_line(line: str) -> SerialRecord | None:
     parts = [part.strip() for part in line.split(",")]
-    if len(parts) != 4 or parts[0] not in VALID_RECORD_TYPES:
+    if not parts:
         return None
     try:
-        device_ms = int(parts[1])
-        vphs = float(parts[2])
-        vmag = float(parts[3])
-    except ValueError:
+        if parts[0] in STANDARD_RECORD_TYPES and len(parts) == 4:
+            record = SerialRecord(parts[0], int(parts[1]), float(parts[2]), float(parts[3]))
+        elif parts[0] in SAMPLE_RECORD_TYPES and len(parts) == 5:
+            record = SerialRecord(
+                parts[0], int(parts[1]), float(parts[3]), float(parts[4]), int(parts[2])
+            )
+        else:
+            return None
+    except (ValueError, IndexError):
         return None
-    if device_ms < 0:
+    if record.device_ms < 0 or (record.sample_index is not None and record.sample_index < 1):
         return None
-    return SerialRecord(parts[0], device_ms, vphs, vmag)
+    return record
 
 
 def choose_serial_port(requested_port: str | None) -> str:
@@ -97,6 +104,7 @@ class RealtimePlot:
         self.vmag_values: list[float] = []
         self.press_stamps: list[tuple[float, float, float]] = []
         self.cal_stamps: list[tuple[float, float, float]] = []
+        self.cal_samples: list[tuple[float, int, float, float]] = []
 
         plt.ion()
         self.figure, self.axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
@@ -108,6 +116,7 @@ class RealtimePlot:
         self.vmag_line = self.axes[1].plot([], [], color="#DC2626", linewidth=1.5)[0]
         self.press_artists = []
         self.cal_artists = []
+        self.sample_artists = []
 
         self.axes[0].set_title("VPHS - Time Domain")
         self.axes[0].set_ylabel("VPHS (V)")
@@ -175,16 +184,23 @@ class RealtimePlot:
                 f"K3 calibration result at {elapsed:.1f}s: "
                 f"VPHS={record.vphs:.3f}, VMAG={record.vmag:.3f}"
             )
+        elif record.record_type in SAMPLE_RECORD_TYPES and record.sample_index is not None:
+            self.cal_samples.append((elapsed, record.sample_index, record.vphs, record.vmag))
+            print(
+                f"CAL {record.sample_index} at {elapsed:.1f}s: "
+                f"VPHS={record.vphs:.3f}, VMAG={record.vmag:.3f}"
+            )
         self._refresh()
 
     def _refresh(self) -> None:
         self.vphs_line.set_data(self.times, self.vphs_values)
         self.vmag_line.set_data(self.times, self.vmag_values)
 
-        for artist in self.press_artists + self.cal_artists:
+        for artist in self.press_artists + self.cal_artists + self.sample_artists:
             artist.remove()
         self.press_artists = []
         self.cal_artists = []
+        self.sample_artists = []
 
         for index, (elapsed, vphs, vmag) in enumerate(self.press_stamps):
             label = "K3 pressed" if index == 0 else None
@@ -216,6 +232,10 @@ class RealtimePlot:
                 ]
             )
 
+        self._draw_collected_samples(
+            self.cal_samples, "CAL", "#0891B2", "o", "Calibration samples"
+        )
+
         for axis in self.axes:
             axis.relim()
             axis.autoscale_view()
@@ -223,6 +243,41 @@ class RealtimePlot:
             if labels:
                 axis.legend(loc="best")
         self.figure.canvas.draw_idle()
+
+    def _draw_collected_samples(
+        self,
+        samples: list[tuple[float, int, float, float]],
+        name_prefix: str,
+        color: str,
+        marker: str,
+        legend_label: str,
+    ) -> None:
+        for position, (elapsed, sample_index, vphs, vmag) in enumerate(samples):
+            point_name = f"{name_prefix} {sample_index}"
+            legend = legend_label if position == 0 else None
+            for axis, value in zip(self.axes, (vphs, vmag)):
+                point = axis.scatter(
+                    elapsed,
+                    value,
+                    s=48,
+                    marker=marker,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.6,
+                    zorder=7,
+                    label=legend,
+                )
+                annotation = axis.annotate(
+                    point_name,
+                    (elapsed, value),
+                    xytext=(4, 7 if sample_index % 2 else -13),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                    rotation=35,
+                    zorder=8,
+                )
+                self.sample_artists.extend([point, annotation])
 
     def process_events(self) -> None:
         if self.is_open():
@@ -232,7 +287,9 @@ class RealtimePlot:
         return bool(self.plt.fignum_exists(self.figure.number))
 
     def save_jpg(self) -> Path | None:
-        if not self.times and not self.press_stamps and not self.cal_stamps:
+        if not any(
+            (self.times, self.press_stamps, self.cal_stamps, self.cal_samples)
+        ):
             print("No graph data received; no JPG was created.")
             return None
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -272,6 +329,14 @@ def run_simulation(args: argparse.Namespace, plot: RealtimePlot) -> int:
         plot.add_record(SerialRecord("DATA", second * 1000, 1.1 + 0.15 * response, 2.2 + 0.22 * response))
         if second == 12:
             plot.add_record(SerialRecord("K3_PRESS", second * 1000, 1.173, 2.307))
+        if 43 <= second <= 52:
+            sample_index = second - 42
+            plot.add_record(
+                SerialRecord(
+                    "K3_SAMPLE", second * 1000, 1.232 + sample_index * 0.0008,
+                    2.394 + sample_index * 0.0011, sample_index,
+                )
+            )
         if second == 52:
             plot.add_record(SerialRecord("K3_CAL", second * 1000, 1.241, 2.407))
         plot.process_events()

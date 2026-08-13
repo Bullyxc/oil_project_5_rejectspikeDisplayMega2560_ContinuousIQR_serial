@@ -62,6 +62,7 @@ const uint8_t SAMPLE_COUNT = 10;
 - At the instant K3 is pressed, Arduino emits a `K3_PRESS` record using the current raw VPHS/VMAG values.
 - TFT shows a centered 30-second saturation countdown and warns the user not to open the door.
 - After the countdown, calibration collects `SAMPLE_COUNT` samples, one every `SAMPLE_INTERVAL_MS`.
+- Each collected pair is emitted immediately as `K3_SAMPLE` with its 1-based sample number so Python can mark and name it on both plots.
 - The sampling animation and horizontal progress bar run at the same time as real sample collection.
 - Data is filtered using IQR, then mean and SD are calculated.
 - Current SD limits are VPHS `< 0.0010` and VMAG `< 0.0005` (the code includes a small comparison tolerance).
@@ -85,6 +86,7 @@ CSV-like records contain exactly four fields:
 DATA,<ArduinoMillis>,<rawVPHS>,<rawVMAG>
 K3_PRESS,<ArduinoMillis>,<rawVPHS>,<rawVMAG>
 K3_CAL,<ArduinoMillis>,<ReferenceVPHS>,<ReferenceVMAG>
+K3_SAMPLE,<ArduinoMillis>,<SampleNumber>,<rawVPHS>,<rawVMAG>
 ```
 
 Example:
@@ -93,9 +95,10 @@ Example:
 DATA,15234,1.234,2.345
 K3_PRESS,18120,1.236,2.349
 K3_CAL,58150,1.240,2.352
+K3_SAMPLE,59150,1,1.239,2.351
 ```
 
-If ADS1115 initialization fails, Arduino emits `ERROR,ADS1115_INIT`. Python intentionally ignores records that do not match one of the three four-field plotting formats above.
+If ADS1115 initialization fails, Arduino emits `ERROR,ADS1115_INIT`. Python intentionally ignores records that do not match one of the three four-field formats or the five-field K3 sample format above.
 
 Do not reintroduce `CONT`, `CAL`, `MEA`, per-minute logging, Excel logging, or two-hour session control into this protocol unless explicitly requested.
 
@@ -104,13 +107,16 @@ Do not reintroduce `CONT`, `CAL`, `MEA`, per-minute logging, Excel logging, or t
 `realtime_vphs_vmag_plotter.py`:
 
 - Detects Serial ports and asks the user to choose when multiple ports exist; `--port COMx` can select one directly.
-- Accepts only `DATA`, `K3_PRESS`, and `K3_CAL` records.
+- Accepts `DATA`, `K3_PRESS`, `K3_CAL`, and `K3_SAMPLE` records.
 - Uses Arduino `millis()` relative to the first accepted record for elapsed time in seconds.
 - Shows two plots in one window:
   - VPHS versus elapsed time on top.
   - VMAG versus elapsed time on the bottom.
 - Marks `K3_PRESS` on both plots with yellow circles.
 - Marks successful `K3_CAL` values on both plots with yellow stars.
+- Marks every collected Calibration sample on both plots and annotates it `CAL 1`, `CAL 2`, and so on.
+- K2 Measurement samples are not sent as special markers and are not annotated on the graph.
+- With the current `SAMPLE_COUNT = 10`, K3 contributes `CAL 1` through `CAL 10` on each plot.
 - Provides a TextBox for typing or pasting the graph title.
 - Provides a `Save JPG` button that captures the graph at that moment without stopping acquisition.
 - The save controls are temporarily hidden from the exported image and restored afterward.
