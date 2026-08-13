@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 BAUD_RATE = 9600
-SATURATION_PREFIX = "SAT"
+SATURATION_PREFIX = "CONT"
 
 
 @dataclass(frozen=True)

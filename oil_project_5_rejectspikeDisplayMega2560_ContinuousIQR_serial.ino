@@ -15,20 +15,25 @@ bool switchK3 = true;
 bool lastswitchK1 = true;
 bool lastswitchK2 = true;
 bool lastswitchK3 = true;
+bool k1ModeBeforePress = false;
+bool k1LongPressHandled = false;
 
 // ตัวแปรสำหรับโหมด Continuous
 bool isContinuousMode = false;
 unsigned long k1PressTime = 0;
 unsigned long lastContinuousUpdate = 0;
-unsigned long lastContinuousLog = 0;
-unsigned long lastSaturationSerialUpdate = 0;
-unsigned long saturationElapsedSeconds = 0;
-uint16_t continuousRecordCount = 0;
-bool continuousLoggingComplete = false;
+unsigned long lastContinuousSerialUpdate = 0;
+unsigned long continuousElapsedSeconds = 0;
+unsigned long lastSingleSerialUpdate = 0;
+unsigned long singleElapsedSeconds = 0;
+uint8_t singleSerialMode = 0; // 0=off, 1=K3 raw (CAL), 2=K2 calculated (MEA)
 
-const unsigned long CONTINUOUS_LOG_INTERVAL_MS = 60000UL;
-const unsigned long SATURATION_SERIAL_INTERVAL_MS = 1000UL;
-const uint16_t CONTINUOUS_MAX_RECORDS = 120;
+const unsigned long SERIAL_STREAM_INTERVAL_MS = 1000UL;
+const unsigned long SAMPLE_INTERVAL_MS = 1000UL;
+const unsigned long K1_LONG_PRESS_MS = 3000UL;
+
+// Adjustable countdown before K3 calibration or K2 measurement starts.
+const uint8_t COUNTDOWN_TIME_SECONDS = 30;
 
 // กำหนดขาเชื่อมต่อจอ TFT (ST7789) สำหรับ Arduino Mega2560
 #define TFT_CS    10
@@ -40,13 +45,14 @@ uint8_t rotation = 3; // แนวนอน (Landscape) 320x240
 // ADS1115
 Adafruit_ADS1115 ads;
 
-// ค่าการวัด
-const int NUM_SAMPLES = 20; 
+// Adjustable number of samples collected by K3 and K2 (minimum 4 for IQR).
+const uint8_t SAMPLE_COUNT = 10;
+static_assert(SAMPLE_COUNT >= 4, "SAMPLE_COUNT must be at least 4 for IQR filtering");
 
 float ReferenceVPHS = 0, ReferenceVMAG = 0;
 float MeasurementVPHS = 0, MeasurementVMAG = 0;
-float VPHSValue[NUM_SAMPLES];
-float VMAGValue[NUM_SAMPLES];
+float VPHSValue[SAMPLE_COUNT];
+float VMAGValue[SAMPLE_COUNT];
 
 bool isCalibrated = false; 
 
@@ -278,16 +284,19 @@ void loop() {
 
   // === จัดการปุ่ม K1 (สลับโหมด Continuous / Single / Clear Screen) ===
   if (switchK1 == LOW && lastswitchK1 == HIGH) { 
-    // เพิ่งเริ่มกดปุ่ม ให้จำเวลาไว้
     k1PressTime = millis();
+    k1ModeBeforePress = isContinuousMode;
+    k1LongPressHandled = false;
   }
   
   if (switchK1 == LOW && lastswitchK1 == LOW) { 
     // กำลังกดค้างอยู่ เช็คว่าถึง 3 วินาที (3000ms) หรือยัง
-    if (millis() - k1PressTime >= 3000) { 
-      isContinuousMode = !isContinuousMode; // สลับโหมด
+    if (!k1LongPressHandled && millis() - k1PressTime >= K1_LONG_PRESS_MS) {
+      k1LongPressHandled = true;
+      isContinuousMode = !k1ModeBeforePress; // Toggle from the mode before K1 was pressed.
       
       if (isContinuousMode) {
+        singleSerialMode = 0;
         // แสดง Splash Screen ก่อนเข้าโหมด Continuous
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextColor(ST77XX_YELLOW);
@@ -300,15 +309,11 @@ void loop() {
         delay(2000);
         drawContinuousLayout();
 
-        // Start a fresh 2-hour logging session after the splash screen.
+        // Start a fresh 1-second Continuous stream after the splash screen.
         lastContinuousUpdate = millis();
-        lastContinuousLog = lastContinuousUpdate;
-        lastSaturationSerialUpdate = lastContinuousUpdate;
-        saturationElapsedSeconds = 0;
-        continuousRecordCount = 0;
-        continuousLoggingComplete = false;
-        Serial.println("#SATURATION_HEADER,Second,VPHS,VMAG");
-        Serial.println("Minute,VPHS,VMAG");
+        lastContinuousSerialUpdate = lastContinuousUpdate;
+        continuousElapsedSeconds = 0;
+        Serial.println("#CONT_HEADER,Second,VPHS,VMAG");
       } else {
         // แสดง Splash Screen ก่อนกลับเข้าโหมด Single
         tft.fillScreen(ST77XX_BLACK);
@@ -319,10 +324,6 @@ void loop() {
         tft.setCursor((320 - strlen(msg1)*24)/2, 90); tft.print(msg1);
         tft.setCursor((320 - strlen(msg2)*24)/2, 130); tft.print(msg2);
         
-        if (!continuousLoggingComplete) {
-          Serial.print("#CONTINUOUS_STOPPED,");
-          Serial.println(continuousRecordCount);
-        }
         Serial.println("\n*** RETURNED TO SINGLE MODE ***\n");
         delay(2000);
         showLogo();
@@ -336,18 +337,19 @@ void loop() {
     }
   }
 
-  if (switchK1 == HIGH && lastswitchK1 == LOW) { 
-    // ปล่อยปุ่มแล้ว เช็คว่าถ้ากดไม่ถึง 3 วิ (Short Press) ให้กลับหน้าโลโก้
-    if (millis() - k1PressTime < 3000) { 
-      if (!isContinuousMode) {
-        showLogo(); // ถ้าอยู่ในโหมดปกติ กดสั้นคือโชว์โลโก้/เคลียร์หน้าจอ
-      }
+  if (switchK1 == HIGH && lastswitchK1 == LOW) {
+    // A short K1 press clears only in Single mode. A long press has already
+    // been handled above and must never clear calibration data.
+    if (!k1LongPressHandled && !k1ModeBeforePress) {
+      clearAllMeasurementData();
+      showLogo();
     }
   }
+
   lastswitchK1 = switchK1;
 
   // === จัดการปุ่ม K2 และ K3 (ให้ทำงานเฉพาะโหมด Single เท่านั้น) ===
-  if (!isContinuousMode) {
+  if (!isContinuousMode && switchK1 == HIGH) {
     // K3 → Calibrate
     if(switchK3 != lastswitchK3 && switchK3 == LOW) {
       calibrateReference();
@@ -359,6 +361,36 @@ void loop() {
       takeMeasurement();
     }
     lastswitchK2 = switchK2;
+
+    // After K3 or K2, stream the selected Single-mode values every second.
+    if (singleSerialMode != 0 &&
+        millis() - lastSingleSerialUpdate >= SERIAL_STREAM_INTERVAL_MS) {
+      lastSingleSerialUpdate += SERIAL_STREAM_INTERVAL_MS;
+      singleElapsedSeconds++;
+
+      int16_t adc0 = ads.readADC_SingleEnded(0);
+      int16_t adc1 = ads.readADC_SingleEnded(1);
+      float currentVPHS = adc0 * 0.1875 / 1000.0;
+      float currentVMAG = adc1 * 0.1875 / 1000.0;
+
+      if (singleSerialMode == 1) {
+        Serial.print("CAL,");
+        Serial.print(singleElapsedSeconds);
+        Serial.print(',');
+        Serial.print(currentVPHS, 3);
+        Serial.print(',');
+        Serial.println(currentVMAG, 3);
+      } else {
+        float liveRealVPHS = ReferenceVPHS - currentVPHS;
+        float liveRealVMAG = ReferenceVMAG - currentVMAG;
+        Serial.print("MEA,");
+        Serial.print(singleElapsedSeconds);
+        Serial.print(',');
+        Serial.print(liveRealVPHS, 3);
+        Serial.print(',');
+        Serial.println(liveRealVMAG, 3);
+      }
+    }
   }
 
   // === อัปเดตการแสดงผลในโหมด Continuous (ทุก 50ms) ===
@@ -387,37 +419,17 @@ void loop() {
       tft.setCursor(15, 175);
       tft.print(vmagStr);
 
-      // Independent 1-second stream for the saturation graph logger.
-      // The existing 1-minute CSV stream below remains unchanged.
-      if (millis() - lastSaturationSerialUpdate >= SATURATION_SERIAL_INTERVAL_MS) {
-        lastSaturationSerialUpdate += SATURATION_SERIAL_INTERVAL_MS;
-        saturationElapsedSeconds++;
+      // Independent 1-second Continuous stream for the graph logger.
+      if (millis() - lastContinuousSerialUpdate >= SERIAL_STREAM_INTERVAL_MS) {
+        lastContinuousSerialUpdate += SERIAL_STREAM_INTERVAL_MS;
+        continuousElapsedSeconds++;
 
-        Serial.print("SAT,");
-        Serial.print(saturationElapsedSeconds);
+        Serial.print("CONT,");
+        Serial.print(continuousElapsedSeconds);
         Serial.print(',');
         Serial.print(rawVPHS, 3);
         Serial.print(',');
         Serial.println(rawVMAG, 3);
-      }
-
-      // Log the latest reading once per minute for a maximum of 120 minutes.
-      if (!continuousLoggingComplete &&
-          millis() - lastContinuousLog >= CONTINUOUS_LOG_INTERVAL_MS) {
-        lastContinuousLog += CONTINUOUS_LOG_INTERVAL_MS;
-        continuousRecordCount++;
-
-        Serial.print(continuousRecordCount);
-        Serial.print(',');
-        Serial.print(rawVPHS, 3);
-        Serial.print(',');
-        Serial.println(rawVMAG, 3);
-
-        if (continuousRecordCount >= CONTINUOUS_MAX_RECORDS) {
-          continuousLoggingComplete = true;
-          Serial.print("#CONTINUOUS_COMPLETE,");
-          Serial.println(continuousRecordCount);
-        }
       }
     }
   }
@@ -436,6 +448,89 @@ void showLogo() {
   tft.fillScreen(ST77XX_BLACK);
   // ขนาดโลโก้ 128x64 คูณ 2 เท่า = 256x128 จัดให้อยู่กึ่งกลางจอ (320x240)
   drawScaledBitmap(32, 56, epd_bitmap_nrt_logo_top_copy, 128, 64, tft.color565(0, 255, 0), ST77XX_BLACK, 2);
+}
+
+void clearAllMeasurementData() {
+  isCalibrated = false;
+  singleSerialMode = 0;
+  singleElapsedSeconds = 0;
+  continuousElapsedSeconds = 0;
+  ReferenceVPHS = 0.0;
+  ReferenceVMAG = 0.0;
+  MeasurementVPHS = 0.0;
+  MeasurementVMAG = 0.0;
+
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    VPHSValue[i] = 0.0;
+    VMAGValue[i] = 0.0;
+  }
+
+  Serial.println("#CLEAR,K1,ALL_MEASUREMENT_DATA");
+}
+
+bool abortIfK1Pressed() {
+  if (digitalRead(switchPinK1) != LOW) {
+    return false;
+  }
+
+  // Abort the current K2/K3 operation immediately, then classify this K1
+  // action as a short press or a 3-second hold before changing stored data.
+  unsigned long blockingPressStarted = millis();
+  while (digitalRead(switchPinK1) == LOW &&
+         millis() - blockingPressStarted < K1_LONG_PRESS_MS) {
+    delay(10);
+  }
+
+  if (digitalRead(switchPinK1) == LOW) {
+    // Long K1 hold from Single mode: enter Continuous and preserve Cal/Mea.
+    isContinuousMode = true;
+    singleSerialMode = 0;
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextSize(4);
+    const char* msg1 = "CONTINUOUS";
+    const char* msg2 = "MODE";
+    tft.setCursor((320 - strlen(msg1) * 24) / 2, 90);
+    tft.print(msg1);
+    tft.setCursor((320 - strlen(msg2) * 24) / 2, 130);
+    tft.print(msg2);
+    delay(2000);
+    drawContinuousLayout();
+
+    lastContinuousUpdate = millis();
+    lastContinuousSerialUpdate = lastContinuousUpdate;
+    continuousElapsedSeconds = 0;
+    Serial.println("#CONT_HEADER,Second,VPHS,VMAG");
+
+    while (digitalRead(switchPinK1) == LOW) {
+      delay(10);
+    }
+  } else {
+    // Short K1 press from Single mode: clear all stored measurement data.
+    clearAllMeasurementData();
+    showLogo();
+  }
+
+  switchK1 = HIGH;
+  lastswitchK1 = HIGH;
+  lastswitchK2 = digitalRead(switchPinK2);
+  lastswitchK3 = digitalRead(switchPinK3);
+  k1ModeBeforePress = isContinuousMode;
+  k1LongPressHandled = true;
+  k1PressTime = millis();
+  return true;
+}
+
+bool waitWithK1Priority(unsigned long durationMs) {
+  unsigned long waitStarted = millis();
+  while (millis() - waitStarted < durationMs) {
+    if (abortIfK1Pressed()) {
+      return false;
+    }
+    delay(10);
+  }
+  return true;
 }
 
 // ฟังก์ชันวาดหน้า Layout เปล่าๆ สำหรับโหมด Continuous
@@ -467,7 +562,7 @@ void drawContinuousLayout() {
 // ฟังก์ชันจัดการข้อมูล (กรอง Outlier ด้วย IQR, หา Mean และ SD)
 void processDataWithIQR(float data[], int size, float &outMean, float &outSD, int &outValidCount) {
   // 1. สร้าง Array สำรองเพื่อเรียงลำดับข้อมูล
-  float sortedData[NUM_SAMPLES];
+  float sortedData[SAMPLE_COUNT];
   for (int i = 0; i < size; i++) {
     sortedData[i] = data[i];
   }
@@ -524,25 +619,44 @@ void processDataWithIQR(float data[], int size, float &outMean, float &outSD, in
 }
 
 void calibrateReference() {
+  if (!showSaturationCountdown("K3")) {
+    return;
+  }
   showAnimation("Calibrating..."); 
+  Serial.println("#CAL_HEADER,Second,VPHS,VMAG");
 
-  // 1. เก็บค่า 20 ค่า
-  for(int i=0;i<NUM_SAMPLES;i++){
+  // Collect saturated samples at the configured interval.
+  for(int i=0;i<SAMPLE_COUNT;i++){
+    if (!waitWithK1Priority(SAMPLE_INTERVAL_MS)) {
+      return;
+    }
     int16_t adc0 = ads.readADC_SingleEnded(0);
     int16_t adc1 = ads.readADC_SingleEnded(1);
     float v0 = adc0*0.1875/1000;
     float v1 = adc1*0.1875/1000;
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
-    delay(50);
+
+    Serial.print("CAL,");
+    Serial.print(i + 1);
+    Serial.print(',');
+    Serial.print(v0, 3);
+    Serial.print(',');
+    Serial.println(v1, 3);
+    updateSamplingProgress(i + 1);
   }
 
   float sdVPHS, sdVMAG;
   int validVPHS, validVMAG;
   
   // 2-6. กรอง IQR และคำนวณสถิติ
-  processDataWithIQR(VPHSValue, NUM_SAMPLES, ReferenceVPHS, sdVPHS, validVPHS);
-  processDataWithIQR(VMAGValue, NUM_SAMPLES, ReferenceVMAG, sdVMAG, validVMAG);
+  processDataWithIQR(VPHSValue, SAMPLE_COUNT, ReferenceVPHS, sdVPHS, validVPHS);
+  processDataWithIQR(VMAGValue, SAMPLE_COUNT, ReferenceVMAG, sdVMAG, validVMAG);
+
+  // K3 selects a continuous 1-second stream of live raw sensor values.
+  singleSerialMode = 1;
+  singleElapsedSeconds = SAMPLE_COUNT;
+  lastSingleSerialUpdate = millis();
 
   if (sdVPHS >= (SD_THRESHOLD_VPHS - 0.00001) || sdVMAG >= (SD_THRESHOLD_VMAG - 0.00001)) {
     isCalibrated = false; 
@@ -554,17 +668,25 @@ void calibrateReference() {
     Serial.print("SD VMAG :  "); Serial.println(sdVMAG, 4);
     Serial.println("-> Please calibrate again");
     Serial.println("---------------------------");
+    Serial.println("#SINGLE_ERROR,K3,HIGH_VARIANCE");
   } else {
     isCalibrated = true; 
     showMeasurementResult("--- CALIBRATION ---", "Cal VPHS", ReferenceVPHS, sdVPHS, "Cal VMAG", ReferenceVMAG, sdVMAG, tft.color565(255, 255, 0));
 
     Serial.println("---------------------------");
-    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.println("/20 (IQR Filtered)");
+    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.print('/'); Serial.print(SAMPLE_COUNT); Serial.println(" (IQR Filtered)");
     Serial.print("Cal VPHS :  "); Serial.println(ReferenceVPHS, 3);
     Serial.print("SD VPHS  :  "); Serial.println(sdVPHS, 4);
     Serial.print("Cal VMAG :  "); Serial.println(ReferenceVMAG, 3);
     Serial.print("SD VMAG  :  "); Serial.println(sdVMAG, 4);
     Serial.println("---------------------------");
+
+    // Machine-readable CSV output after a successful K3 calibration.
+    Serial.println("#SINGLE_HEADER,Button,VPHS,VMAG");
+    Serial.print("SINGLE,K3,");
+    Serial.print(ReferenceVPHS, 3);
+    Serial.print(',');
+    Serial.println(ReferenceVMAG, 3);
   }
 }
 
@@ -575,31 +697,51 @@ void takeMeasurement() {
     Serial.println("Warning: System not calibrated!");
     Serial.println("-> Please press K3 to calibrate first.");
     Serial.println("---------------------------");
+    Serial.println("#SINGLE_ERROR,K2,NOT_CALIBRATED");
     return; 
   }
 
+  if (!showSaturationCountdown("K2")) {
+    return;
+  }
   showAnimation("Measuring..."); 
+  Serial.println("#MEA_HEADER,Second,VPHS,VMAG");
 
-  // 1. เก็บค่า 20 ค่า
-  for(int i=0;i<NUM_SAMPLES;i++){
+  // Collect saturated samples at the configured interval.
+  for(int i=0;i<SAMPLE_COUNT;i++){
+    if (!waitWithK1Priority(SAMPLE_INTERVAL_MS)) {
+      return;
+    }
     int16_t adc0 = ads.readADC_SingleEnded(0);
     int16_t adc1 = ads.readADC_SingleEnded(1);
     float v0 = adc0*0.1875/1000;
     float v1 = adc1*0.1875/1000;
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
-    delay(50);
+
+    Serial.print("MEA,");
+    Serial.print(i + 1);
+    Serial.print(',');
+    Serial.print(ReferenceVPHS - v0, 3);
+    Serial.print(',');
+    Serial.println(ReferenceVMAG - v1, 3);
+    updateSamplingProgress(i + 1);
   }
 
   float sdVPHS, sdVMAG;
   int validVPHS, validVMAG;
   
   // 2-6. กรอง IQR และคำนวณสถิติ
-  processDataWithIQR(VPHSValue, NUM_SAMPLES, MeasurementVPHS, sdVPHS, validVPHS);
-  processDataWithIQR(VMAGValue, NUM_SAMPLES, MeasurementVMAG, sdVMAG, validVMAG);
+  processDataWithIQR(VPHSValue, SAMPLE_COUNT, MeasurementVPHS, sdVPHS, validVPHS);
+  processDataWithIQR(VMAGValue, SAMPLE_COUNT, MeasurementVMAG, sdVMAG, validVMAG);
 
   float RealVPHS = ReferenceVPHS - MeasurementVPHS;
   float RealVMAG = ReferenceVMAG - MeasurementVMAG;
+
+  // K2 selects a continuous 1-second stream of live calculated values.
+  singleSerialMode = 2;
+  singleElapsedSeconds = SAMPLE_COUNT;
+  lastSingleSerialUpdate = millis();
 
   if (sdVPHS >= (SD_THRESHOLD_VPHS - 0.00001) || sdVMAG >= (SD_THRESHOLD_VMAG - 0.00001)) {
     showErrorScreen("MEASURE", sdVPHS, sdVMAG);
@@ -610,59 +752,115 @@ void takeMeasurement() {
     Serial.print("SD VMAG :  "); Serial.println(sdVMAG, 4);
     Serial.println("-> Please measure again");
     Serial.println("---------------------------");
+    Serial.println("#SINGLE_ERROR,K2,HIGH_VARIANCE");
   } else {
     showMeasurementResult("--- MEASUREMENT ---", "Mea VPHS", RealVPHS, sdVPHS, "Mea VMAG", RealVMAG, sdVMAG, tft.color565(0, 255, 0));
 
     Serial.println("---------------------------");
-    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.println("/20 (IQR Filtered)");
+    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.print('/'); Serial.print(SAMPLE_COUNT); Serial.println(" (IQR Filtered)");
     Serial.print("Mea VPHS :  "); Serial.println(RealVPHS, 3);
     Serial.print("SD VPHS  :  "); Serial.println(sdVPHS, 4);
     Serial.print("Mea VMAG :  "); Serial.println(RealVMAG, 3);
     Serial.print("SD VMAG  :  "); Serial.println(sdVMAG, 4);
     Serial.println("---------------------------");
+
+    // Machine-readable CSV output after a successful K2 measurement.
+    Serial.println("#SINGLE_HEADER,Button,VPHS,VMAG");
+    Serial.print("SINGLE,K2,");
+    Serial.print(RealVPHS, 3);
+    Serial.print(',');
+    Serial.println(RealVMAG, 3);
   }
 }
 
 // ==========================================
 // ฟังก์ชันจัดการ UI และ แอนิเมชันสำหรับจอ TFT
 // ==========================================
+bool showSaturationCountdown(const char* action) {
+  tft.fillScreen(ST77XX_BLACK);
+
+  const char* title = "Preparing...";
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor((320 - strlen(title) * 18) / 2, 50);
+  tft.print(title);
+
+  const char* warning = "DO NOT OPEN!";
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor((320 - strlen(warning) * 18) / 2, 165);
+  tft.print(warning);
+
+  for (int remaining = COUNTDOWN_TIME_SECONDS; remaining > 0; remaining--) {
+    tft.fillRect(55, 75, 210, 65, ST77XX_BLACK);
+    tft.setTextSize(5);
+    tft.setTextColor(ST77XX_WHITE);
+
+    char countdownText[8];
+    snprintf(countdownText, sizeof(countdownText), "%d", remaining);
+    tft.setCursor((320 - strlen(countdownText) * 30) / 2, 100);
+    tft.print(countdownText);
+
+    Serial.print("#COUNTDOWN,");
+    Serial.print(action);
+    Serial.print(',');
+    Serial.println(remaining);
+    if (!waitWithK1Priority(1000)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void showAnimation(const char* text) {
   tft.fillScreen(ST77XX_BLACK);
-  
+
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(3);
-  
-  int textHeight = 24;
-  int boxSize = 30;
-  int gap = 20;
-  int totalBlockHeight = textHeight + gap + boxSize;
-  
-  int startBlockY = (240 - totalBlockHeight) / 2;
-
   int textLen = strlen(text);
-  int textX = (320 - (textLen * 18)) / 2; 
-  tft.setCursor(textX, startBlockY);
+  int textX = (320 - (textLen * 18)) / 2;
+  tft.setCursor(textX, 50);
   tft.print(text);
 
-  int space = 10;
-  int totalWidth = (boxSize * 6) + (space * 5);
-  int startX = (320 - totalWidth) / 2;
-  int boxY = startBlockY + textHeight + gap;
+  // Empty horizontal progress bar. It is filled by each real sensor sample.
+  tft.drawRect(29, 109, 262, 32, ST77XX_WHITE);
+  tft.fillRect(30, 110, 260, 30, ST77XX_BLACK);
+  updateSamplingProgress(0);
+}
 
-  for(int i = 0; i < 6; i++) {
-    tft.drawRect(startX + (i * (boxSize + space)), boxY, boxSize, boxSize, ST77XX_WHITE);
+void updateSamplingProgress(int completedSamples) {
+  if (completedSamples < 0) completedSamples = 0;
+  if (completedSamples > SAMPLE_COUNT) completedSamples = SAMPLE_COUNT;
+
+  const int barX = 30;
+  const int barY = 110;
+  const int barWidth = 260;
+  const int barHeight = 30;
+  int filledWidth = (barWidth * completedSamples) / SAMPLE_COUNT;
+  int percent = (100 * completedSamples) / SAMPLE_COUNT;
+
+  tft.fillRect(barX, barY, barWidth, barHeight, ST77XX_BLACK);
+  if (filledWidth > 0) {
+    tft.fillRect(barX, barY, filledWidth, barHeight, ST77XX_GREEN);
   }
 
-  Serial.print("\n");
-  Serial.print(text);
-  Serial.print(" ");
+  char percentText[6];
+  snprintf(percentText, sizeof(percentText), "%d%%", percent);
 
-  for(int i = 0; i < 6; i++) {
-    tft.fillRect(startX + (i * (boxSize + space)), boxY, boxSize, boxSize, ST77XX_WHITE);
-    Serial.print(".");
-    delay(400);
-  }
-  Serial.println();
+  tft.fillRect(0, 160, 320, 28, ST77XX_BLACK);
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor((320 - strlen(percentText) * 18) / 2, 165);
+  tft.print(percentText);
+
+  // char samplesText[18];
+  // snprintf(samplesText, sizeof(samplesText), "Samples %d/%d", completedSamples, SAMPLE_COUNT);
+
+  // tft.fillRect(0, 190, 320, 28, ST77XX_BLACK);
+  // tft.setTextSize(2);
+  // tft.setTextColor(ST77XX_CYAN);
+  // tft.setCursor((320 - strlen(samplesText) * 12) / 2, 195);
+  // tft.print(samplesText);
 }
 
 void showMeasurementResult(const char* title, const char* label1, float val1, float sd1, const char* label2, float val2, float sd2, uint16_t mainColor) {
