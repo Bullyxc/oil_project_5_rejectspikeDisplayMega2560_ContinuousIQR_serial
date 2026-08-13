@@ -22,13 +22,10 @@ bool k1LongPressHandled = false;
 bool isContinuousMode = false;
 unsigned long k1PressTime = 0;
 unsigned long lastContinuousUpdate = 0;
-unsigned long lastContinuousSerialUpdate = 0;
-unsigned long continuousElapsedSeconds = 0;
-unsigned long lastSingleSerialUpdate = 0;
-unsigned long singleElapsedSeconds = 0;
-uint8_t singleSerialMode = 0; // 0=off, 1=K3 raw (CAL), 2=K2 calculated (MEA)
+unsigned long lastRawSerialOutput = 0;
 
-const unsigned long SERIAL_STREAM_INTERVAL_MS = 1000UL;
+// Adjustable interval for the always-on VPHS/VMAG Serial stream.
+const unsigned long SERIAL_OUTPUT_INTERVAL_MS = 1000UL;
 const unsigned long SAMPLE_INTERVAL_MS = 1000UL;
 const unsigned long K1_LONG_PRESS_MS = 3000UL;
 
@@ -241,7 +238,6 @@ void drawScaledBitmap(int16_t x, int16_t y, const uint8_t *bitmap, int16_t w, in
 // ==========================================
 void setup() {
   Serial.begin(9600);
-  Serial.println("\n\nSystem Initializing...");
 
   pinMode(switchPinK1, INPUT_PULLUP);
   pinMode(switchPinK2, INPUT_PULLUP);
@@ -252,23 +248,22 @@ void setup() {
   tft.invertDisplay(false); 
   tft.setRotation(rotation);
 
-  Serial.println("TFT 2.4\" (ST7789) Initialized Successfully.");
-
   // เริ่มต้น ADS1115
   if(!ads.begin(0x48)) {
-    Serial.println("Failed to initialize ADS1115");
+    Serial.println("ERROR,ADS1115_INIT");
     while(1);
-  } else {
-    Serial.println("ADS1115 Initialized Successfully.");
   }
+
+  // Start the new clean Serial protocol immediately after ADS1115 is ready.
+  outputRawSerialSample("DATA");
 
   // แอนิเมชันเปิดเครื่อง โชว์ 2 โลโก้สลับกัน
   tft.fillScreen(ST77XX_BLACK);
   drawScaledBitmap(32, 56, epd_bitmap_nrt_logo_top_copy, 128, 64, tft.color565(0, 255, 0), ST77XX_BLACK, 2);
-  delay(1500);
+  waitWithSerialOutput(1500);
   tft.fillScreen(ST77XX_BLACK);
   drawScaledBitmap(32, 56, epd_bitmap_LOGO_RMUTR_, 128, 64, tft.color565(255, 0, 0), ST77XX_BLACK, 2);
-  delay(1500);
+  waitWithSerialOutput(1500);
   
   // ค้างไว้ที่โลโก้ NRT พร้อมรอคำสั่ง
   showLogo();
@@ -281,6 +276,7 @@ void loop() {
   switchK1 = digitalRead(switchPinK1);
   switchK2 = digitalRead(switchPinK2);
   switchK3 = digitalRead(switchPinK3);
+  serviceRawSerialOutput();
 
   // === จัดการปุ่ม K1 (สลับโหมด Continuous / Single / Clear Screen) ===
   if (switchK1 == LOW && lastswitchK1 == HIGH) { 
@@ -296,7 +292,6 @@ void loop() {
       isContinuousMode = !k1ModeBeforePress; // Toggle from the mode before K1 was pressed.
       
       if (isContinuousMode) {
-        singleSerialMode = 0;
         // แสดง Splash Screen ก่อนเข้าโหมด Continuous
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextColor(ST77XX_YELLOW);
@@ -306,14 +301,10 @@ void loop() {
         tft.setCursor((320 - strlen(msg1)*24)/2, 90); tft.print(msg1);
         tft.setCursor((320 - strlen(msg2)*24)/2, 130); tft.print(msg2);
         
-        delay(2000);
+        waitWithSerialOutput(2000);
         drawContinuousLayout();
 
-        // Start a fresh 1-second Continuous stream after the splash screen.
         lastContinuousUpdate = millis();
-        lastContinuousSerialUpdate = lastContinuousUpdate;
-        continuousElapsedSeconds = 0;
-        Serial.println("#CONT_HEADER,Second,VPHS,VMAG");
       } else {
         // แสดง Splash Screen ก่อนกลับเข้าโหมด Single
         tft.fillScreen(ST77XX_BLACK);
@@ -324,13 +315,15 @@ void loop() {
         tft.setCursor((320 - strlen(msg1)*24)/2, 90); tft.print(msg1);
         tft.setCursor((320 - strlen(msg2)*24)/2, 130); tft.print(msg2);
         
-        Serial.println("\n*** RETURNED TO SINGLE MODE ***\n");
-        delay(2000);
+        waitWithSerialOutput(2000);
         showLogo();
       }
       
       // รอจนกว่าจะปล่อยปุ่ม เพื่อป้องกันการสลับโหมดซ้ำๆ ทันที
-      while(digitalRead(switchPinK1) == LOW) { delay(10); }
+      while(digitalRead(switchPinK1) == LOW) {
+        serviceRawSerialOutput();
+        delay(10);
+      }
       switchK1 = HIGH; // รีเซ็ตสถานะปุ่ม
       lastswitchK1 = HIGH; // <--- เพิ่มบรรทัดนี้ เพื่อบอกระบบว่าเคลียร์การกดปุ่มแล้ว จะได้ไม่ไปทริกเกอร์กดสั้นซ้ำ!
       k1PressTime = millis();
@@ -352,6 +345,7 @@ void loop() {
   if (!isContinuousMode && switchK1 == HIGH) {
     // K3 → Calibrate
     if(switchK3 != lastswitchK3 && switchK3 == LOW) {
+      outputRawSerialSample("K3_PRESS");
       calibrateReference();
     }
     lastswitchK3 = switchK3;
@@ -362,35 +356,6 @@ void loop() {
     }
     lastswitchK2 = switchK2;
 
-    // After K3 or K2, stream the selected Single-mode values every second.
-    if (singleSerialMode != 0 &&
-        millis() - lastSingleSerialUpdate >= SERIAL_STREAM_INTERVAL_MS) {
-      lastSingleSerialUpdate += SERIAL_STREAM_INTERVAL_MS;
-      singleElapsedSeconds++;
-
-      int16_t adc0 = ads.readADC_SingleEnded(0);
-      int16_t adc1 = ads.readADC_SingleEnded(1);
-      float currentVPHS = adc0 * 0.1875 / 1000.0;
-      float currentVMAG = adc1 * 0.1875 / 1000.0;
-
-      if (singleSerialMode == 1) {
-        Serial.print("CAL,");
-        Serial.print(singleElapsedSeconds);
-        Serial.print(',');
-        Serial.print(currentVPHS, 3);
-        Serial.print(',');
-        Serial.println(currentVMAG, 3);
-      } else {
-        float liveRealVPHS = ReferenceVPHS - currentVPHS;
-        float liveRealVMAG = ReferenceVMAG - currentVMAG;
-        Serial.print("MEA,");
-        Serial.print(singleElapsedSeconds);
-        Serial.print(',');
-        Serial.print(liveRealVPHS, 3);
-        Serial.print(',');
-        Serial.println(liveRealVMAG, 3);
-      }
-    }
   }
 
   // === อัปเดตการแสดงผลในโหมด Continuous (ทุก 50ms) ===
@@ -419,18 +384,6 @@ void loop() {
       tft.setCursor(15, 175);
       tft.print(vmagStr);
 
-      // Independent 1-second Continuous stream for the graph logger.
-      if (millis() - lastContinuousSerialUpdate >= SERIAL_STREAM_INTERVAL_MS) {
-        lastContinuousSerialUpdate += SERIAL_STREAM_INTERVAL_MS;
-        continuousElapsedSeconds++;
-
-        Serial.print("CONT,");
-        Serial.print(continuousElapsedSeconds);
-        Serial.print(',');
-        Serial.print(rawVPHS, 3);
-        Serial.print(',');
-        Serial.println(rawVMAG, 3);
-      }
     }
   }
 
@@ -441,10 +394,6 @@ void loop() {
 // ฟังก์ชันการทำงานหลัก
 // ==========================================
 void showLogo() {
-  Serial.println("\n===========================");
-  Serial.println("      SHOWING NRT LOGO     ");
-  Serial.println("===========================");
-
   tft.fillScreen(ST77XX_BLACK);
   // ขนาดโลโก้ 128x64 คูณ 2 เท่า = 256x128 จัดให้อยู่กึ่งกลางจอ (320x240)
   drawScaledBitmap(32, 56, epd_bitmap_nrt_logo_top_copy, 128, 64, tft.color565(0, 255, 0), ST77XX_BLACK, 2);
@@ -452,9 +401,6 @@ void showLogo() {
 
 void clearAllMeasurementData() {
   isCalibrated = false;
-  singleSerialMode = 0;
-  singleElapsedSeconds = 0;
-  continuousElapsedSeconds = 0;
   ReferenceVPHS = 0.0;
   ReferenceVMAG = 0.0;
   MeasurementVPHS = 0.0;
@@ -464,8 +410,45 @@ void clearAllMeasurementData() {
     VPHSValue[i] = 0.0;
     VMAGValue[i] = 0.0;
   }
+}
 
-  Serial.println("#CLEAR,K1,ALL_MEASUREMENT_DATA");
+void outputRawSerialSample(const char* recordType) {
+  int16_t adc0 = ads.readADC_SingleEnded(0);
+  int16_t adc1 = ads.readADC_SingleEnded(1);
+  float rawVPHS = adc0 * 0.1875 / 1000.0;
+  float rawVMAG = adc1 * 0.1875 / 1000.0;
+
+  Serial.print(recordType);
+  Serial.print(',');
+  Serial.print(millis());
+  Serial.print(',');
+  Serial.print(rawVPHS, 3);
+  Serial.print(',');
+  Serial.println(rawVMAG, 3);
+  lastRawSerialOutput = millis();
+}
+
+void outputCalculatedCalibrationStamp() {
+  Serial.print("K3_CAL,");
+  Serial.print(millis());
+  Serial.print(',');
+  Serial.print(ReferenceVPHS, 3);
+  Serial.print(',');
+  Serial.println(ReferenceVMAG, 3);
+}
+
+void serviceRawSerialOutput() {
+  if (millis() - lastRawSerialOutput >= SERIAL_OUTPUT_INTERVAL_MS) {
+    outputRawSerialSample("DATA");
+  }
+}
+
+void waitWithSerialOutput(unsigned long durationMs) {
+  unsigned long waitStarted = millis();
+  while (millis() - waitStarted < durationMs) {
+    serviceRawSerialOutput();
+    delay(10);
+  }
 }
 
 bool abortIfK1Pressed() {
@@ -484,8 +467,6 @@ bool abortIfK1Pressed() {
   if (digitalRead(switchPinK1) == LOW) {
     // Long K1 hold from Single mode: enter Continuous and preserve Cal/Mea.
     isContinuousMode = true;
-    singleSerialMode = 0;
-
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextColor(ST77XX_YELLOW);
     tft.setTextSize(4);
@@ -495,15 +476,13 @@ bool abortIfK1Pressed() {
     tft.print(msg1);
     tft.setCursor((320 - strlen(msg2) * 24) / 2, 130);
     tft.print(msg2);
-    delay(2000);
+    waitWithSerialOutput(2000);
     drawContinuousLayout();
 
     lastContinuousUpdate = millis();
-    lastContinuousSerialUpdate = lastContinuousUpdate;
-    continuousElapsedSeconds = 0;
-    Serial.println("#CONT_HEADER,Second,VPHS,VMAG");
 
     while (digitalRead(switchPinK1) == LOW) {
+      serviceRawSerialOutput();
       delay(10);
     }
   } else {
@@ -525,6 +504,7 @@ bool abortIfK1Pressed() {
 bool waitWithK1Priority(unsigned long durationMs) {
   unsigned long waitStarted = millis();
   while (millis() - waitStarted < durationMs) {
+    serviceRawSerialOutput();
     if (abortIfK1Pressed()) {
       return false;
     }
@@ -623,7 +603,6 @@ void calibrateReference() {
     return;
   }
   showAnimation("Calibrating..."); 
-  Serial.println("#CAL_HEADER,Second,VPHS,VMAG");
 
   // Collect saturated samples at the configured interval.
   for(int i=0;i<SAMPLE_COUNT;i++){
@@ -637,12 +616,6 @@ void calibrateReference() {
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
 
-    Serial.print("CAL,");
-    Serial.print(i + 1);
-    Serial.print(',');
-    Serial.print(v0, 3);
-    Serial.print(',');
-    Serial.println(v1, 3);
     updateSamplingProgress(i + 1);
   }
 
@@ -653,51 +626,20 @@ void calibrateReference() {
   processDataWithIQR(VPHSValue, SAMPLE_COUNT, ReferenceVPHS, sdVPHS, validVPHS);
   processDataWithIQR(VMAGValue, SAMPLE_COUNT, ReferenceVMAG, sdVMAG, validVMAG);
 
-  // K3 selects a continuous 1-second stream of live raw sensor values.
-  singleSerialMode = 1;
-  singleElapsedSeconds = SAMPLE_COUNT;
-  lastSingleSerialUpdate = millis();
-
   if (sdVPHS >= (SD_THRESHOLD_VPHS - 0.00001) || sdVMAG >= (SD_THRESHOLD_VMAG - 0.00001)) {
     isCalibrated = false; 
     showErrorScreen("CALIBRATE", sdVPHS, sdVMAG);
 
-    Serial.println("---------------------------");
-    Serial.println("Error: High Variance (Unstable)");
-    Serial.print("SD VPHS :  "); Serial.println(sdVPHS, 4);
-    Serial.print("SD VMAG :  "); Serial.println(sdVMAG, 4);
-    Serial.println("-> Please calibrate again");
-    Serial.println("---------------------------");
-    Serial.println("#SINGLE_ERROR,K3,HIGH_VARIANCE");
   } else {
     isCalibrated = true; 
     showMeasurementResult("--- CALIBRATION ---", "Cal VPHS", ReferenceVPHS, sdVPHS, "Cal VMAG", ReferenceVMAG, sdVMAG, tft.color565(255, 255, 0));
-
-    Serial.println("---------------------------");
-    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.print('/'); Serial.print(SAMPLE_COUNT); Serial.println(" (IQR Filtered)");
-    Serial.print("Cal VPHS :  "); Serial.println(ReferenceVPHS, 3);
-    Serial.print("SD VPHS  :  "); Serial.println(sdVPHS, 4);
-    Serial.print("Cal VMAG :  "); Serial.println(ReferenceVMAG, 3);
-    Serial.print("SD VMAG  :  "); Serial.println(sdVMAG, 4);
-    Serial.println("---------------------------");
-
-    // Machine-readable CSV output after a successful K3 calibration.
-    Serial.println("#SINGLE_HEADER,Button,VPHS,VMAG");
-    Serial.print("SINGLE,K3,");
-    Serial.print(ReferenceVPHS, 3);
-    Serial.print(',');
-    Serial.println(ReferenceVMAG, 3);
+    outputCalculatedCalibrationStamp();
   }
 }
 
 void takeMeasurement() {
   if (!isCalibrated) {
     showNotCalibratedScreen(); 
-    Serial.println("---------------------------");
-    Serial.println("Warning: System not calibrated!");
-    Serial.println("-> Please press K3 to calibrate first.");
-    Serial.println("---------------------------");
-    Serial.println("#SINGLE_ERROR,K2,NOT_CALIBRATED");
     return; 
   }
 
@@ -705,7 +647,6 @@ void takeMeasurement() {
     return;
   }
   showAnimation("Measuring..."); 
-  Serial.println("#MEA_HEADER,Second,VPHS,VMAG");
 
   // Collect saturated samples at the configured interval.
   for(int i=0;i<SAMPLE_COUNT;i++){
@@ -719,12 +660,6 @@ void takeMeasurement() {
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
 
-    Serial.print("MEA,");
-    Serial.print(i + 1);
-    Serial.print(',');
-    Serial.print(ReferenceVPHS - v0, 3);
-    Serial.print(',');
-    Serial.println(ReferenceVMAG - v1, 3);
     updateSamplingProgress(i + 1);
   }
 
@@ -738,38 +673,10 @@ void takeMeasurement() {
   float RealVPHS = ReferenceVPHS - MeasurementVPHS;
   float RealVMAG = ReferenceVMAG - MeasurementVMAG;
 
-  // K2 selects a continuous 1-second stream of live calculated values.
-  singleSerialMode = 2;
-  singleElapsedSeconds = SAMPLE_COUNT;
-  lastSingleSerialUpdate = millis();
-
   if (sdVPHS >= (SD_THRESHOLD_VPHS - 0.00001) || sdVMAG >= (SD_THRESHOLD_VMAG - 0.00001)) {
     showErrorScreen("MEASURE", sdVPHS, sdVMAG);
-
-    Serial.println("---------------------------");
-    Serial.println("Error: High Variance (Unstable)");
-    Serial.print("SD VPHS :  "); Serial.println(sdVPHS, 4);
-    Serial.print("SD VMAG :  "); Serial.println(sdVMAG, 4);
-    Serial.println("-> Please measure again");
-    Serial.println("---------------------------");
-    Serial.println("#SINGLE_ERROR,K2,HIGH_VARIANCE");
   } else {
     showMeasurementResult("--- MEASUREMENT ---", "Mea VPHS", RealVPHS, sdVPHS, "Mea VMAG", RealVMAG, sdVMAG, tft.color565(0, 255, 0));
-
-    Serial.println("---------------------------");
-    Serial.print("Valid Data: "); Serial.print(validVPHS); Serial.print('/'); Serial.print(SAMPLE_COUNT); Serial.println(" (IQR Filtered)");
-    Serial.print("Mea VPHS :  "); Serial.println(RealVPHS, 3);
-    Serial.print("SD VPHS  :  "); Serial.println(sdVPHS, 4);
-    Serial.print("Mea VMAG :  "); Serial.println(RealVMAG, 3);
-    Serial.print("SD VMAG  :  "); Serial.println(sdVMAG, 4);
-    Serial.println("---------------------------");
-
-    // Machine-readable CSV output after a successful K2 measurement.
-    Serial.println("#SINGLE_HEADER,Button,VPHS,VMAG");
-    Serial.print("SINGLE,K2,");
-    Serial.print(RealVPHS, 3);
-    Serial.print(',');
-    Serial.println(RealVMAG, 3);
   }
 }
 
@@ -801,10 +708,6 @@ bool showSaturationCountdown(const char* action) {
     tft.setCursor((320 - strlen(countdownText) * 30) / 2, 100);
     tft.print(countdownText);
 
-    Serial.print("#COUNTDOWN,");
-    Serial.print(action);
-    Serial.print(',');
-    Serial.println(remaining);
     if (!waitWithK1Priority(1000)) {
       return false;
     }
