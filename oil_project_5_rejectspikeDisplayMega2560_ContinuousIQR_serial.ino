@@ -21,10 +21,13 @@ bool isContinuousMode = false;
 unsigned long k1PressTime = 0;
 unsigned long lastContinuousUpdate = 0;
 unsigned long lastContinuousLog = 0;
+unsigned long lastSaturationSerialUpdate = 0;
+unsigned long saturationElapsedSeconds = 0;
 uint16_t continuousRecordCount = 0;
 bool continuousLoggingComplete = false;
 
 const unsigned long CONTINUOUS_LOG_INTERVAL_MS = 60000UL;
+const unsigned long SATURATION_SERIAL_INTERVAL_MS = 1000UL;
 const uint16_t CONTINUOUS_MAX_RECORDS = 120;
 
 // กำหนดขาเชื่อมต่อจอ TFT (ST7789) สำหรับ Arduino Mega2560
@@ -300,8 +303,11 @@ void loop() {
         // Start a fresh 2-hour logging session after the splash screen.
         lastContinuousUpdate = millis();
         lastContinuousLog = lastContinuousUpdate;
+        lastSaturationSerialUpdate = lastContinuousUpdate;
+        saturationElapsedSeconds = 0;
         continuousRecordCount = 0;
         continuousLoggingComplete = false;
+        Serial.println("#SATURATION_HEADER,Second,VPHS,VMAG");
         Serial.println("Minute,VPHS,VMAG");
       } else {
         // แสดง Splash Screen ก่อนกลับเข้าโหมด Single
@@ -380,6 +386,20 @@ void loop() {
       dtostrf(rawVMAG, 7, 3, vmagStr);
       tft.setCursor(15, 175);
       tft.print(vmagStr);
+
+      // Independent 1-second stream for the saturation graph logger.
+      // The existing 1-minute CSV stream below remains unchanged.
+      if (millis() - lastSaturationSerialUpdate >= SATURATION_SERIAL_INTERVAL_MS) {
+        lastSaturationSerialUpdate += SATURATION_SERIAL_INTERVAL_MS;
+        saturationElapsedSeconds++;
+
+        Serial.print("SAT,");
+        Serial.print(saturationElapsedSeconds);
+        Serial.print(',');
+        Serial.print(rawVPHS, 3);
+        Serial.print(',');
+        Serial.println(rawVMAG, 3);
+      }
 
       // Log the latest reading once per minute for a maximum of 120 minutes.
       if (!continuousLoggingComplete &&
