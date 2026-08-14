@@ -611,7 +611,7 @@ void processDataWithIQR(float data[], int size, float &outMean, float &outSD, in
 }
 
 void calibrateReference() {
-  if (!showSaturationCountdown("K3")) {
+  if (!showSaturationCountdown("K3", ST77XX_YELLOW)) {
     return;
   }
   showAnimation("Calibrating..."); 
@@ -629,7 +629,7 @@ void calibrateReference() {
     VMAGValue[i] = v1;
     outputCollectedSample("K3_SAMPLE", i + 1, v0, v1);
 
-    updateSamplingProgress(i + 1);
+    updateSamplingProgress(i + 1, ST77XX_YELLOW);
   }
 
   float sdVPHS, sdVMAG;
@@ -656,7 +656,7 @@ void takeMeasurement() {
     return; 
   }
 
-  if (!showSaturationCountdown("K2")) {
+  if (!showSaturationCountdown("K2", ST77XX_GREEN)) {
     return;
   }
   showAnimation("Measuring..."); 
@@ -673,7 +673,7 @@ void takeMeasurement() {
     VPHSValue[i] = v0;
     VMAGValue[i] = v1;
 
-    updateSamplingProgress(i + 1);
+    updateSamplingProgress(i + 1, ST77XX_GREEN);
   }
 
   float sdVPHS, sdVMAG;
@@ -696,7 +696,7 @@ void takeMeasurement() {
 // ==========================================
 // ฟังก์ชันจัดการ UI และ แอนิเมชันสำหรับจอ TFT
 // ==========================================
-bool showSaturationCountdown(const char* action) {
+bool showSaturationCountdown(const char* action, uint16_t mainColor) {
   tft.fillScreen(ST77XX_BLACK);
 
   const char* title = "Preparing...";
@@ -707,7 +707,7 @@ bool showSaturationCountdown(const char* action) {
 
   const char* warning = "DO NOT OPEN!";
   tft.setTextSize(3);
-  tft.setTextColor(ST77XX_YELLOW);
+  tft.setTextColor(mainColor);
   tft.setCursor((320 - strlen(warning) * 18) / 2, 165);
   tft.print(warning);
 
@@ -741,10 +741,10 @@ void showAnimation(const char* text) {
   // Empty horizontal progress bar. It is filled by each real sensor sample.
   tft.drawRect(29, 109, 262, 32, ST77XX_WHITE);
   tft.fillRect(30, 110, 260, 30, ST77XX_BLACK);
-  updateSamplingProgress(0);
+  updateSamplingProgress(0, ST77XX_BLACK);
 }
 
-void updateSamplingProgress(int completedSamples) {
+void updateSamplingProgress(int completedSamples, uint16_t mainColor) {
   if (completedSamples < 0) completedSamples = 0;
   if (completedSamples > SAMPLE_COUNT) completedSamples = SAMPLE_COUNT;
 
@@ -757,7 +757,7 @@ void updateSamplingProgress(int completedSamples) {
 
   tft.fillRect(barX, barY, barWidth, barHeight, ST77XX_BLACK);
   if (filledWidth > 0) {
-    tft.fillRect(barX, barY, filledWidth, barHeight, ST77XX_GREEN);
+    tft.fillRect(barX, barY, filledWidth, barHeight, mainColor); //สีหลอด
   }
 
   char percentText[6];
